@@ -86,13 +86,28 @@ object Activator {
 
     // ------------------------------------------------------------------ pairing
 
+    /** Address of the last pairing service found. Some phones (e.g. Samsung) don't listen on 127.0.0.1. */
+    @Volatile private var pairingHost: String? = null
+    @Volatile private var connectHost: String? = null
+
     private fun discoverPort(ctx: Context, type: String, timeoutMs: Long): Int {
         val latch = CountDownLatch(1)
         var found = -1
-        val mdns = AdbMdns(ctx, type) { _, port -> if (port > 0) { found = port; latch.countDown() } }
+        val mdns = AdbMdns(ctx, type) { host, port ->
+            if (port > 0) {
+                if (type == AdbMdns.SERVICE_TYPE_TLS_PAIRING) pairingHost = host?.hostAddress
+                if (type == AdbMdns.SERVICE_TYPE_TLS_CONNECT) connectHost = host?.hostAddress
+                found = port; latch.countDown()
+            }
+        }
         mdns.start()
         try { latch.await(timeoutMs, TimeUnit.MILLISECONDS) } finally { runCatching { mdns.stop() } }
         return found
+    }
+
+    private fun pairOnce(ctx: Context, host: String, port: Int, code: String) {
+        val adb = LocalAdb(AdbKeys.get(ctx))
+        try { adb.pair(host, port, code) } finally { runCatching { adb.disconnect() } }
     }
 
     /** Pairs with the "Pair device with pairing code" dialog that must be open in Wireless debugging. */
@@ -106,8 +121,16 @@ object Activator {
                 Result.failure(IllegalStateException("Pairing dialog not found. Keep “Pair device with pairing code” open and try again."))
             } else {
                 _busy.value = "Pairing…"
-                val adb = LocalAdb(AdbKeys.get(ctx))
-                try { adb.pair("127.0.0.1", port, clean) } finally { runCatching { adb.disconnect() } }
+                val host = pairingHost
+                if (host != null && host != "127.0.0.1") {
+                    try {
+                        pairOnce(ctx, host, port, clean)
+                    } catch (e: java.net.ConnectException) {
+                        pairOnce(ctx, "127.0.0.1", port, clean)
+                    }
+                } else {
+                    pairOnce(ctx, "127.0.0.1", port, clean)
+                }
                 Store.adbPaired = true
                 Result.success(Unit)
             }
@@ -132,9 +155,12 @@ object Activator {
 
     private fun launchCommand(ctx: Context, port: Int, token: String): String {
         val apk = ctx.applicationInfo.sourceDir
-        return "pkill -f com.gamepadman.helper.HelperMain; " +
-            "setsid app_process -Djava.class.path=$apk /system/bin --nice-name=gamepadman_helper " +
-            "com.gamepadman.helper.HelperMain $port $token </dev/null >/dev/null 2>&1 &"
+        // app_process replaces argv with the nice name, so the helper's cmdline starts with "gpm_helper";
+        // anchoring the pattern keeps pkill from matching (and killing) the shell running this line.
+        // Detach completely: subshell + setsid + nohup survive the ADB session closing (tested on Android 16).
+        return "pkill -f '^gpm_helper'; " +
+            "(setsid nohup app_process -Djava.class.path=$apk /system/bin --nice-name=gpm_helper " +
+            "com.gamepadman.helper.HelperMain $port $token </dev/null >/data/local/tmp/gpm_helper.log 2>&1 &); sleep 1"
     }
 
     /** Is a helper answering on the saved port? */
@@ -167,7 +193,8 @@ object Activator {
                 connectAdb(ctx, it)
                 _busy.value = "Starting the controller helper…"
                 Store.helperPort = port; Store.helperToken = token
-                runShell(it, launchCommand(ctx, port, token))
+                val out = runShell(it, launchCommand(ctx, port, token))
+                Log.i(TAG, "launch output: [${out.trim()}]")
                 if (!hasSecureSettings(ctx)) {
                     // Lets GamepadMan turn Wireless debugging on by itself after a reboot.
                     runShell(it, "pm grant ${ctx.packageName} ${Manifest.permission.WRITE_SECURE_SETTINGS}")
@@ -206,7 +233,16 @@ object Activator {
         }
         _busy.value = "Connecting to Wireless debugging…"
         try {
-            if (!adb.connectTls(ctx, 15_000)) throw IllegalStateException("Wireless debugging not found on this network")
+            val port = discoverPort(ctx, AdbMdns.SERVICE_TYPE_TLS_CONNECT, 15_000)
+            if (port <= 0) throw IllegalStateException("Wireless debugging not found on this network")
+            val host = connectHost ?: "127.0.0.1"
+            val ok = try {
+                adb.connect(host, port)
+            } catch (e: java.net.ConnectException) {
+                if (host == "127.0.0.1") throw e
+                adb.connect("127.0.0.1", port)
+            }
+            if (!ok && !adb.isConnected) throw IllegalStateException("Could not connect to Wireless debugging")
         } catch (e: AdbPairingRequiredException) {
             Store.adbPaired = false
             throw NeedsPairing("This phone needs to be paired again")
@@ -215,12 +251,24 @@ object Activator {
     }
 
     private fun runShell(adb: LocalAdb, cmd: String): String {
-        val stream = adb.openStream("shell:$cmd")
-        return try {
-            stream.openInputStream().readBytes().toString(Charsets.UTF_8)
+        // "exec:" has no PTY, so background processes are not hung up when the session ends.
+        val stream = adb.openStream("exec:$cmd")
+        val out = java.io.ByteArrayOutputStream()
+        try {
+            val input = stream.openInputStream()
+            val buf = ByteArray(4096)
+            while (true) {
+                val n = input.read(buf)
+                if (n < 0) break
+                out.write(buf, 0, n)
+            }
+        } catch (e: java.io.IOException) {
+            // libadb reports the end of a finished shell command as "Stream closed".
+            if (e.message?.contains("closed", ignoreCase = true) != true) throw e
         } finally {
             runCatching { stream.close() }
         }
+        return out.toString(Charsets.UTF_8.name())
     }
 
     private fun launchWithRoot(ctx: Context): Result<Unit> {

@@ -17,7 +17,7 @@ import kotlin.system.exitProcess
 
 /**
  * Privileged helper started by GamepadMan itself (through its built-in ADB client or root) as:
- *   app_process -Djava.class.path=<apk> /system/bin --nice-name=gamepadman_helper com.gamepadman.helper.HelperMain <port> <token>
+ *   app_process -Djava.class.path=<apk> /system/bin --nice-name=gpm_helper com.gamepadman.helper.HelperMain <port> <token>
  * Listens on 127.0.0.1 only and requires the secret token. The virtual controller only exists while
  * the app is connected, so a crashed/closed app never leaves a stuck controller behind.
  */
